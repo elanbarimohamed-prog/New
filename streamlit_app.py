@@ -24,10 +24,10 @@ except st.errors.StreamlitSecretNotFoundError:
     pass
 
 from app.config import settings
-from app.core.models import AnalysisResult
+from app.core.models import AnalysisResult, NewsCollection
 from app.streamlit_support import (
     article_rows, article_tone, csv_export, demo_result, display_verdict,
-    evidence_counts, export_name, safe_url,
+    evidence_counts, export_name, safe_url, collection_rows, collection_csv,
 )
 
 st.markdown("""
@@ -53,11 +53,14 @@ def get_scorer():
     return FinBERTService()
 
 
-def execute_analysis(ticker, window_mode, article_limit, enable_llm, progress):
-    from app.services.orchestrator import analyze
-    # Create and close all async network clients inside this run's event loop.
-    return asyncio.run(analyze(ticker, window_mode, article_limit, get_scorer(),
-                               enable_llm, progress))
+def fetch_collection(ticker, window_mode, article_limit, progress):
+    from app.services.orchestrator import collect_headlines
+    return asyncio.run(collect_headlines(ticker, window_mode, article_limit, progress))
+
+
+def score_collection(collection, enable_llm, progress):
+    from app.services.orchestrator import analyze_collection
+    return asyncio.run(analyze_collection(collection, get_scorer(), enable_llm, progress))
 
 
 def remember(result):
@@ -82,6 +85,7 @@ with st.sidebar:
     force_refresh = st.checkbox("Fetch fresh results", help="Skip this session's five-minute result cache.")
     st.divider()
     if st.button("Explore a demo", use_container_width=True):
+        st.session_state.pop("collection", None)
         remember(demo_result())
     st.caption("Demo uses fictional headlines and fixed example scores. No news or AI calls.")
     runs = st.session_state.get("history", [])
@@ -93,10 +97,13 @@ with st.sidebar:
             format_func=lambda i: f"{runs[i]['ticker']} · {runs[i]['session']['run_timestamp_utc'][11:16]} UTC",
         )
         if st.button("Open selected analysis", use_container_width=True):
+            st.session_state.pop("collection", None)
             st.session_state["result"] = runs[selection]
         if st.button("Clear session history", use_container_width=True):
             st.session_state["history"] = []
             st.session_state.pop("result", None)
+            st.session_state.pop("collection", None)
+            st.session_state["collection_cache"] = {}
             st.session_state["analysis_cache"] = {}
             st.rerun()
     st.caption("History is private to this browser session and can reset. Download results to keep them.")
@@ -113,49 +120,119 @@ with st.form("analysis_form"):
         ticker = st.text_input("Asset symbol", value="AAPL", max_chars=16,
                                placeholder="AAPL, NVDA, EUR/USD, GC=F, BTC-USD")
     with right:
-        submitted = st.form_submit_button("Analyze news", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Fetch live headlines", type="primary", use_container_width=True)
 st.caption("Try AAPL · NVDA · SPY · EUR/USD · GC=F · BTC-USD")
 
 if submitted:
     ticker = ticker.strip().upper()
     if not ticker:
         st.warning("Enter an asset symbol first.")
-    elif enable_llm and time.time() - st.session_state.get("last_audit_request", 0) < 60:
-        st.warning("Please wait one minute between AI audit requests.")
     else:
-        key = (ticker, window_mode, article_limit, enable_llm, settings.get_config_hash())
-        cached = st.session_state.setdefault("analysis_cache", {}).get(key)
+        st.session_state.pop("result", None)
+        key = ("headlines-v2", ticker, window_mode, article_limit)
+        cache = st.session_state.setdefault("collection_cache", {})
+        cached = cache.get(key)
         if not force_refresh and cached and time.time() - cached["saved_at"] < 300:
-            st.session_state["result"] = cached["result"]
-            st.info("Loaded your recent analysis. Its original timestamp is shown below.")
+            st.session_state["collection"] = cached["collection"]
+            st.info("Loaded your recently fetched headlines. Use Fetch fresh results to refresh.")
         else:
-            if enable_llm:
-                st.session_state["last_audit_request"] = time.time()
-            with st.status("Analyzing financial news", expanded=True) as status:
+            st.session_state.pop("collection", None)
+            with st.status("Fetching live headlines", expanded=True) as status:
                 bar = st.progress(0.0)
                 stage_text = st.empty()
                 def progress(value, text):
                     bar.progress(value)
                     stage_text.write(text)
                 try:
-                    result = execute_analysis(ticker, window_mode, article_limit, enable_llm, progress)
-                    remember(result)
-                    cache = st.session_state["analysis_cache"]
-                    cache[key] = {"saved_at": time.time(), "result": result.model_dump(mode="json")}
-                    if len(cache) > 15:
-                        del cache[next(iter(cache))]
-                    status.update(label="Analysis complete", state="complete", expanded=False)
+                    collection = fetch_collection(ticker, window_mode, article_limit, progress)
+                    snapshot = collection.model_dump(mode="json")
+                    st.session_state["collection"] = snapshot
+                    if any(p.get("status") == "SUCCESS" for p in collection.provider_outcomes.values()):
+                        cache[key] = {"saved_at": time.time(), "collection": snapshot}
+                        if len(cache) > 15:
+                            del cache[next(iter(cache))]
+                    status.update(label=f"Fetched {len(collection.articles)} unique headlines",
+                                  state="complete" if collection.articles else "error", expanded=False)
                 except Exception as exc:
-                    status.update(label="Analysis could not complete", state="error")
-                    # Never show raw provider exceptions: they can contain request credentials.
-                    st.error("Check the symbol and your internet connection, then retry. If this is the first "
-                             "live run, FinBERT must download its model. Hosting logs contain more detail.")
+                    status.update(label="Headline collection could not complete", state="error")
+                    st.error("Could not collect news. Check the symbol and try again.")
                     from app.utils.logging import logger
-                    logger.error("Streamlit analysis failed (%s)", type(exc).__name__)
+                    logger.error("Headline collection failed (%s)", type(exc).__name__)
+
+snapshot = st.session_state.get("collection")
+if snapshot:
+    collection = NewsCollection.model_validate(snapshot)
+    rows = collection_rows(collection)
+    ready_count = sum(r["Status"] == "Ready for analysis" for r in rows)
+    successful = sum(p.get("status") == "SUCCESS" for p in collection.provider_outcomes.values())
+    st.markdown("### Live headline collection")
+    st.write(f"**{collection.asset.ticker} · {collection.asset.company_name}**")
+    st.caption(f"Fetched {collection.session.run_timestamp_utc:%d %b %Y, %H:%M} UTC. "
+               "These are real feed results; no AI model was required to collect them.")
+    cols = st.columns(3)
+    cols[0].metric("Unique headlines fetched", len(collection.articles))
+    cols[1].metric("Ready for analysis", ready_count)
+    cols[2].metric("Feeds responding", f"{successful}/{len(collection.provider_outcomes)}")
+    if successful == 0:
+        st.error("Every feed request failed on this host. Open Source connection status below for the reasons.")
+    elif not rows:
+        st.info("The feeds responded but returned no articles for this search.")
+    with st.expander("Source connection status", expanded=successful == 0):
+        status_rows = [{"Feed": name, "Status": p.get("status", ""),
+                        "Returned": p.get("count", 0), "Inside window": p.get("fresh_count", 0),
+                        "Response (ms)": p.get("latency_ms", 0), "Details": p.get("error", ""),
+                        "Feed URL": safe_url(p.get("url", "")) or ""}
+                       for name, p in collection.provider_outcomes.items()]
+        st.dataframe(status_rows, hide_index=True, use_container_width=True,
+                     column_config={"Feed URL": st.column_config.LinkColumn("Feed URL")})
+    st.caption("Google News searches index publishers; a responding feed does not imply direct publisher API access. "
+               "Yahoo RSS may report the feed name when an original publisher is not supplied.")
+    if rows:
+        eligible_only = st.checkbox("Only show headlines ready for analysis", value=True)
+        search = st.text_input("Search collected headlines", placeholder="Search a headline or publisher")
+        shown = [r for r in rows if (not eligible_only or r["Status"] == "Ready for analysis")
+                 and (not search or search.casefold() in (r["Headline"] + " " + r["Publisher / feed"]).casefold())]
+        st.dataframe([{k: v for k, v in r.items() if k != "Article ID"} for r in shown],
+                     hide_index=True, use_container_width=True,
+                     column_config={"Link": st.column_config.LinkColumn("Read source")})
+        st.download_button("Download collected headlines · CSV", collection_csv(collection),
+                           file_name=f"{export_name(collection.asset.ticker)}_collected_headlines.csv",
+                           mime="text/csv", key="collection_csv")
+        if shown:
+            inspected_id = st.selectbox("Read a collected headline", [r["Article ID"] for r in shown],
+                                        format_func=lambda value: next(r["Headline"] for r in shown
+                                                                       if r["Article ID"] == value))
+            article = next(a for a in collection.articles if a.article_id == inspected_id)
+            st.write(article.summary or "No summary was supplied by this feed.")
+            if safe_url(article.canonical_url):
+                st.link_button("Open news article", article.canonical_url)
+    if st.button("Analyze collected headlines with FinBERT", type="primary", disabled=ready_count == 0):
+        if enable_llm and time.time() - st.session_state.get("last_audit_request", 0) < 60:
+            st.warning("Please wait one minute between AI audit requests.")
+        else:
+            if enable_llm:
+                st.session_state["last_audit_request"] = time.time()
+            with st.status("Analyzing collected headlines", expanded=True) as status:
+                bar = st.progress(0.0)
+                message = st.empty()
+                def progress(value, text):
+                    bar.progress(value)
+                    message.write(text)
+                try:
+                    result = score_collection(collection, enable_llm, progress)
+                    remember(result)
+                    status.update(label="Sentiment analysis complete", state="complete", expanded=False)
+                except Exception as exc:
                     st.session_state.pop("result", None)
+                    status.update(label="AI analysis unavailable", state="error")
+                    st.error("Headlines were collected successfully and remain available above. "
+                             "FinBERT could not finish loading or scoring. Check the hosting logs for model errors.")
+                    from app.utils.logging import logger
+                    logger.exception("FinBERT analysis failed (%s)", type(exc).__name__)
+    st.divider()
 
 data = st.session_state.get("result")
-if not data:
+if not data and not snapshot:
     st.divider()
     a, b, c = st.columns(3)
     with a:
@@ -168,7 +245,7 @@ if not data:
         st.markdown("#### 03 · Inspect")
         st.write("See the score and inspect each headline behind it.")
     st.info("Start with a symbol above, or explore the demo in the sidebar.")
-else:
+elif data:
     result = AnalysisResult.model_validate(data)
     counts = evidence_counts(result)
     if result.data_status == "DEMO":

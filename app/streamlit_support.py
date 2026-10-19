@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 from app.core.constants import DIRECTIONAL_THRESHOLD
 from app.core.enums import AssetType, DecisionVerdict, PipelineMode, ProviderType, SessionType
-from app.core.models import AnalysisResult, PipelineMetrics, ScoredArticle
+from app.core.models import AnalysisResult, PipelineMetrics, ScoredArticle, NewsCollection
 from app.core.session_window import SessionWindow, compute_session_window
 from app.services.aggregator_service import AggregatorService
 
@@ -104,6 +104,40 @@ def csv_export(result: AnalysisResult) -> bytes:
 
 def export_name(ticker: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", ticker)
+
+
+def collection_rows(collection: NewsCollection):
+    from app.services.deduplication_service import DeduplicationService
+    fresh, _samples, _stale, _undated = DeduplicationService.filter_by_session_window(
+        collection.articles, collection.session)
+    kept, excluded, _clusters = DeduplicationService.process_and_deduplicate(
+        fresh, collection.asset.ticker, collection.asset.company_name,
+        max_articles=collection.article_limit)
+    kept_ids = {a.article_id for a in kept}
+    reasons = {a.article_id: reason.value for a, reason, _ in excluded}
+    rows = []
+    for a in collection.articles:
+        reason = reasons.get(a.article_id, "")
+        if a.published_at_utc is None:
+            reason = "MISSING_TIMESTAMP"
+        elif not collection.session.is_timestamp_in_window(a.published_at_utc):
+            reason = "OUTSIDE_SELECTED_WINDOW"
+        rows.append({
+            "Headline": a.title, "Publisher / feed": a.source_name,
+            "Published (UTC)": a.published_at_utc.isoformat() if a.published_at_utc else "Undated",
+            "Status": "Ready for analysis" if a.article_id in kept_ids else reason or "Excluded",
+            "Link": safe_url(a.canonical_url) or "", "Article ID": a.article_id,
+        })
+    return rows
+
+
+def collection_csv(collection: NewsCollection):
+    output = io.StringIO(newline="")
+    fields = ["Headline", "Publisher / feed", "Published (UTC)", "Status", "Link", "Article ID"]
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows({k: csv_cell(v) for k, v in row.items()} for row in collection_rows(collection))
+    return output.getvalue().encode("utf-8-sig")
 
 
 def demo_result() -> AnalysisResult:

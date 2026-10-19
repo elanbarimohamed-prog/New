@@ -15,7 +15,12 @@ Verified locally with Python 3.12 and Streamlit 1.50.0:
 - Lazy scorer and batch-output mapping.
 
 The automated tests use simulated news and model outputs.
-Real FinBERT weights/inference, authenticated OpenRouter calls, live news feeds,
+Live RSS endpoints were subsequently checked for AAPL, and their returned XML was
+parsed and rendered through the real collection pipeline and Streamlit AppTest.
+The automated suite also verifies collection without quote API/model calls and
+preservation of headlines after a model failure.
+
+Real FinBERT weights/inference, authenticated OpenRouter calls,
 and deployment on Streamlit Community Cloud have not been validated in this environment.
 The full PyTorch runtime test was attempted but could not finish because the
 workspace ran out of disk space during dependency extraction. Temporary downloads

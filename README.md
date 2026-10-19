@@ -6,6 +6,12 @@ inspect the evidence, and export results.
 
 ## Start here
 
+**News first:** enter a symbol and click **Fetch live headlines**. This makes real
+RSS requests and displays headlines, publication times, source links, and per-feed
+connection status without loading FinBERT. Then click **Analyze collected headlines
+with FinBERT** if you want sentiment scores. If model inference fails, the collected
+headlines remain readable and downloadable.
+
 - Main application file: **streamlit_app.py**
 - Recommended Python: **3.12** (3.11 is also supported by the selected main dependencies).
 - No Node.js, React build, FastAPI server, database, or API key is required for the basic app.
@@ -75,7 +81,8 @@ Verify pricing and enforce account spending limits with the provider.
 ## What is included
 
 - Multi-asset symbol handling: stocks, ETFs, forex, futures/commodities, crypto.
-- Yahoo Finance and Google News RSS collection, plus forex-specific feeds.
+- Direct Yahoo Finance symbol RSS, Google News financial searches, CNBC direct RSS,
+  and forex-specific feeds. Sources are fetched concurrently with individual timeouts.
 - Freshness, relevance, and duplicate filtering.
 - CPU FinBERT model shared safely across Streamlit reruns and browser sessions.
 - Rolling 24-hour window or the original New York market-session window.
@@ -125,7 +132,8 @@ News tone does not establish fair value, future return, or a profitable trading 
 - **Module not found:** install requirements with the same Python used to run Streamlit.
 - **Model download fails:** check host network access to Hugging Face; retry after a transient outage.
 - **No fresh news:** try Last 24 hours or a widely covered asset; undated/stale stories are excluded.
-- **Some feeds unavailable:** the result uses surviving feeds and explicitly warns about reduced coverage.
+- **Some feeds unavailable:** expand **Source connection status** to see each feed's
+  returned count, fresh count, response time, and errors. Collection uses the surviving feeds.
 - **App exceeds host memory:** use a host with more memory; lowering article count cannot shrink weights.
 - **AI checkbox disabled:** configure both OPENROUTER_API_KEY and LLM_MODEL_ID in secrets.
 - **Streamlit entrypoint not found:** streamlit_app.py must be at the selected repository path.

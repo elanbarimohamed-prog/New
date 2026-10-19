@@ -6,7 +6,7 @@ import uuid
 from app.config import settings
 from app.core.enums import PipelineMode
 from app.core.exceptions import NewsUnavailableException
-from app.core.models import AnalysisResult, PipelineMetrics, ScoredArticle
+from app.core.models import AnalysisResult, PipelineMetrics, ScoredArticle, NewsCollection
 from app.services.aggregator_service import AggregatorService
 from app.services.deduplication_service import DeduplicationService
 from app.services.news_service import NewsService
@@ -14,21 +14,40 @@ from app.services.ticker_service import TickerService
 from app.streamlit_support import analysis_window, evidence_counts
 
 
+async def collect_headlines(ticker, window_mode, article_limit, progress=None):
+    started = time.perf_counter()
+    if progress:
+        progress(.10, "Preparing the news search...")
+    asset = TickerService.resolve_for_news(ticker)
+    session = analysis_window(window_mode, asset.asset_type)
+    if progress:
+        progress(.25, "Fetching public RSS feeds in parallel...")
+    articles, providers = await NewsService.fetch_news_for_session(
+        asset.ticker, asset.company_name, session, asset.asset_type, asset.yf_symbol)
+    if progress:
+        progress(1.0, f"Fetched {len(articles)} unique headlines.")
+    return NewsCollection(asset=asset, session=session, articles=articles,
+                          provider_outcomes=providers, window_mode=window_mode,
+                          article_limit=article_limit,
+                          collection_latency_ms=(time.perf_counter() - started) * 1000)
+
+
 async def analyze(ticker, window_mode, article_limit, scorer, enable_llm=False, progress=None):
+    collection = await collect_headlines(ticker, window_mode, article_limit, progress)
+    return await analyze_collection(collection, scorer, enable_llm, progress)
+
+
+async def analyze_collection(collection, scorer, enable_llm=False, progress=None):
     started = time.perf_counter()
     latencies = {}
     def report(fraction, text):
         if progress:
             progress(fraction, text)
 
-    report(.05, "Resolving the asset...")
-    asset = await asyncio.to_thread(TickerService.validate_and_resolve, ticker)
-    session = analysis_window(window_mode, asset.asset_type)
-    report(.15, "Collecting recent headlines from news feeds...")
-    step = time.perf_counter()
-    raw, providers = await NewsService.fetch_news_for_session(
-        asset.ticker, asset.company_name, session, asset.asset_type, asset.yf_symbol)
-    latencies["Collect news"] = (time.perf_counter() - step) * 1000
+    asset, session = collection.asset, collection.session
+    raw, providers = collection.articles, collection.provider_outcomes
+    article_limit = collection.article_limit
+    latencies["Collect news"] = collection.collection_latency_ms
     if not providers or all(p.get("status") == "FAILED" for p in providers.values()):
         raise NewsUnavailableException()
     failed = [name for name, status in providers.items() if status.get("status") == "FAILED"]
@@ -92,6 +111,7 @@ async def analyze(ticker, window_mode, article_limit, scorer, enable_llm=False, 
         rationale=rationale, articles=evidence, warnings=warnings + extra,
         pipeline_mode=mode, data_status=status, llm_summary=summary or None,
         metrics=PipelineMetrics(
+            provider_outcomes=providers,
             total_sources=len(providers), distinct_clusters=len({a.cluster_id for a in scored}),
             articles_ingested=len(raw), articles_retained=len(scored),
             articles_deduplicated=len(excluded), articles_scored_local=len(scored),

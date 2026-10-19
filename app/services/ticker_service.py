@@ -40,6 +40,17 @@ CRYPTO_ALIASES = {
 }
 
 KNOWN_DISPLAY_NAMES = {
+    "AAPL": "Apple",
+    "NVDA": "Nvidia",
+    "MSFT": "Microsoft",
+    "GOOGL": "Alphabet",
+    "GOOG": "Alphabet",
+    "AMZN": "Amazon",
+    "META": "Meta Platforms",
+    "TSLA": "Tesla",
+    "SPY": "SPDR S&P 500 ETF",
+    "QQQ": "Invesco QQQ ETF",
+    "BRK-B": "Berkshire Hathaway",
     "EUR/USD": "Euro / US Dollar",
     "EURUSD=X": "Euro / US Dollar",
     "USD/JPY": "US Dollar / Japanese Yen",
@@ -80,6 +91,19 @@ class TickerService:
     def clear_cache(cls):
         """Clear the in-memory resolution cache."""
         cls._resolution_cache.clear()
+
+    @classmethod
+    def resolve_for_news(cls, raw_ticker: str) -> Asset:
+        """Resolve syntax without a quote-provider call blocking headline collection.
+
+        Common asset names are mapped locally; other assets use their symbol.
+        This is not a listing/existence validation.
+        """
+        display, symbol, kind = cls.format_yf_ticker(raw_ticker)
+        if raw_ticker.strip().upper() in cls._resolution_cache:
+            return cls._resolution_cache[raw_ticker.strip().upper()]
+        name = KNOWN_DISPLAY_NAMES.get(symbol, KNOWN_DISPLAY_NAMES.get(display, display))
+        return Asset(ticker=display, company_name=name, exchange="", asset_type=kind, yf_symbol=symbol)
 
     @staticmethod
     def normalize_ticker(raw_ticker: str) -> str:

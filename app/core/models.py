@@ -37,6 +37,16 @@ class IngestedArticle(BaseModel):
     raw_provider_metadata: dict = Field(default_factory=dict)
 
 
+class NewsCollection(BaseModel):
+    asset: Asset
+    session: SessionWindow
+    articles: list[IngestedArticle]
+    provider_outcomes: dict[str, dict]
+    collection_latency_ms: float = 0
+    window_mode: str = "Last 24 hours"
+    article_limit: int = 40
+
+
 class ScoredArticle(BaseModel):
     article_id: str
     provider: ProviderType
@@ -74,6 +84,7 @@ class PipelineRationale(BaseModel):
 
 
 class PipelineMetrics(BaseModel):
+    provider_outcomes: dict[str, dict] = Field(default_factory=dict)
     total_sources: int = 0
     distinct_publishers: int = 0
     distinct_clusters: int = 0

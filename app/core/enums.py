@@ -33,6 +33,7 @@ class SessionType(str, Enum):
 
 
 class ProviderType(str, Enum):
+    DIRECT_RSS = "DIRECT_RSS"
     YFINANCE = "YFINANCE"
     FINNHUB = "FINNHUB"
     GOOGLE_RSS_AGGREGATOR = "GOOGLE_RSS_AGGREGATOR"

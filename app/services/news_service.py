@@ -103,8 +103,8 @@ class NewsService:
 
             # Link
             canonical_url = (
-                content.get("canonicalUrl", {}).get("url")
-                or content.get("clickThroughUrl", {}).get("url")
+                (content.get("canonicalUrl") or {}).get("url")
+                or (content.get("clickThroughUrl") or {}).get("url")
                 or item.get("link", f"https://finance.yahoo.com/quote/{yf_ticker}")
             )
 
@@ -167,6 +167,8 @@ class NewsService:
         and sets raw_provider_metadata['publisher_inferred'] = True.
         """
         feed = feedparser.parse(feed_content)
+        if not getattr(feed, "version", "") and not getattr(feed, "entries", []):
+            raise ValueError("The source did not return an RSS or Atom feed.")
         articles: list[IngestedArticle] = []
         now = datetime.now(timezone.utc)
 
@@ -174,6 +176,13 @@ class NewsService:
             raw_title = getattr(entry, "title", "")
             raw_summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
             link = getattr(entry, "link", "")
+            # Yahoo's direct symbol RSS often omits <source>; recover the
+            # original publisher from its normal Yahoo news <guid> URL.
+            inferred_origin = ""
+            if provider == ProviderType.YFINANCE:
+                guid = str(getattr(entry, "id", ""))
+                if guid.startswith(("http://", "https://")):
+                    inferred_origin = urllib.parse.urlsplit(guid).hostname or ""
 
             # Publisher from entry.source.title
             publisher = ""
@@ -186,7 +195,7 @@ class NewsService:
                     publisher = (getattr(source_obj, "title", "") or getattr(source_obj, "value", "") or "").strip()
 
             if not publisher:
-                publisher = default_source_name
+                publisher = inferred_origin or default_source_name
                 inferred = True
 
             title = cls._clean_entry_title(raw_title, publisher)
@@ -197,9 +206,10 @@ class NewsService:
 
             # Publication time
             pub_time: datetime | None = None
-            if hasattr(entry, "published_parsed") and entry.published_parsed:
+            parsed_date = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+            if parsed_date:
                 try:
-                    pub_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                    pub_time = datetime(*parsed_date[:6], tzinfo=timezone.utc)
                 except Exception:
                     pub_time = None
 
@@ -242,177 +252,99 @@ class NewsService:
         then parses the XML content via feedparser.
         A well-formed feed with 0 entries is SUCCESS.
         """
-        timeout = httpx.Timeout(8.0, connect=4.0)
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        timeout = httpx.Timeout(10.0, connect=4.0)
+        with httpx.Client(timeout=timeout, follow_redirects=True, headers={
+            "User-Agent": "SentimentPulse/1.0 (public RSS reader)",
+            "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9",
+        }) as client:
             resp = client.get(url)
             resp.raise_for_status()
             content = resp.content
             return cls.parse_rss_feed_content(content, default_source_name, provider)
 
-    @classmethod
-    async def fetch_news_for_session(
-        cls,
-        ticker: str,
-        company_name: str,
-        session: SessionWindow,
-        asset_type: AssetType = AssetType.EQUITY,
-        yf_symbol: str = "",
-    ) -> tuple[list[IngestedArticle], dict[str, dict]]:
-        """
-        Massive multi-source news ingestion bounded to current session lookback:
-        1. Yahoo Finance API news
-        2. Forex dedicated feeds if Forex
-        3. Google News RSS bounded by when:{N}h and financial site: sweeps
-        """
-        yf_ticker = yf_symbol or ticker
-        provider_outcomes: dict[str, dict] = {}
-        all_articles: list[IngestedArticle] = []
-        seen_urls = set()
-        seen_titles = set()
-
-        def add_article(art: IngestedArticle):
-            url_norm = art.canonical_url.split("?")[0].rstrip("/").lower()
-            title_norm = art.title.strip().lower()
-            if url_norm and url_norm in seen_urls:
-                return
-            if title_norm and title_norm in seen_titles:
-                return
-            seen_urls.add(url_norm)
-            seen_titles.add(title_norm)
-            all_articles.append(art)
-
-        # 1. Fetch Yahoo Finance API News
-        t0 = time.time()
-        try:
-            yf_items = await asyncio.to_thread(cls._fetch_yfinance_news_sync, yf_ticker)
-            for item in yf_items:
-                add_article(item)
-            provider_outcomes["yfinance"] = {
-                "status": "SUCCESS",
-                "count": len(yf_items),
-                "latency_ms": round((time.time() - t0) * 1000, 1),
-            }
-        except Exception as e:
-            logger.warning(f"Error fetching yfinance news for {yf_ticker}: {e}")
-            provider_outcomes["yfinance"] = {
-                "status": "FAILED",
-                "error": str(e),
-                "count": 0,
-                "latency_ms": round((time.time() - t0) * 1000, 1),
-            }
-
-        # 2. Dedicated Forex feeds
-        if asset_type == AssetType.FOREX or "/" in ticker or "=X" in yf_ticker:
-            t_fx = time.time()
-            fx_feed_configs = [
-                (
-                    "Investing.com Forex",
-                    "https://www.investing.com/rss/news_1.rss",
-                    ProviderType.INVESTING_FOREX_RSS,
-                ),
-                (
-                    "FXStreet",
-                    "https://www.fxstreet.com/rss/news",
-                    ProviderType.FXSTREET_RSS,
-                ),
-                (
-                    "Yahoo Finance Forex RSS",
-                    f"https://finance.yahoo.com/rss/headline?s={yf_ticker}",
-                    ProviderType.YFINANCE,
-                ),
-            ]
-            for feed_name, feed_url, prov_type in fx_feed_configs:
-                key = f"forex_{feed_name.lower().replace(' ', '_').replace('.', '_')}"
-                t_f = time.time()
-                try:
-                    items = await asyncio.to_thread(cls._fetch_feed_httpx_sync, feed_url, feed_name, prov_type)
-                    for item in items:
-                        add_article(item)
-                    provider_outcomes[key] = {
-                        "status": "SUCCESS",
-                        "count": len(items),
-                        "latency_ms": round((time.time() - t_f) * 1000, 1),
-                    }
-                except Exception as e:
-                    logger.warning(f"Failed direct feed {feed_name}: {e}")
-                    provider_outcomes[key] = {
-                        "status": "FAILED",
-                        "error": str(e),
-                        "count": 0,
-                        "latency_ms": round((time.time() - t_f) * 1000, 1),
-                    }
-
-        # 3. Build Google News RSS query with when:{N}h bound
-        lookback_hours = session.window_duration_hours if session else 24.0
-        n_hours = min(72, max(1, math.ceil(lookback_hours) + 1))
-        when_tag = f"when:{n_hours}h"
-
-        # Determine base search subject: For crypto, forex, commodities use asset name
-        if asset_type in (AssetType.CRYPTO, AssetType.FOREX, AssetType.COMMODITY):
-            base_query = company_name or ticker
-        else:
-            base_query = f"{ticker} {company_name}".strip()
-
-        domain_map = (
-            FOREX_COMMODITY_PUBLISHER_DOMAINS
-            if asset_type in (AssetType.FOREX, AssetType.COMMODITY)
-            else EQUITY_PUBLISHER_DOMAINS
-        )
-
-        # 4. Fetch Google News RSS general query and per-publisher sweeps in parallel
-        t_rss = time.time()
-        feed_tasks = []
-        feed_keys = []
-
-        # 4a. General query (no site constraint)
-        gen_query = f"{base_query} {when_tag}"
-        encoded_gen = urllib.parse.quote_plus(gen_query)
-        gen_url = f"https://news.google.com/rss/search?q={encoded_gen}&hl=en-US&gl=US&ceid=US:en"
-        feed_tasks.append(
-            asyncio.to_thread(
-                cls._fetch_feed_httpx_sync, gen_url, "Google News", ProviderType.GOOGLE_RSS_AGGREGATOR
-            )
-        )
-        feed_keys.append("rss_google_news_general")
-
-        # 4b. Site sweeps
-        for pub_name, domain in domain_map.items():
-            sweep_query = f"{base_query} site:{domain} {when_tag}"
-            encoded_sweep = urllib.parse.quote_plus(sweep_query)
-            sweep_url = f"https://news.google.com/rss/search?q={encoded_sweep}&hl=en-US&gl=US&ceid=US:en"
-            feed_tasks.append(
-                asyncio.to_thread(
-                    cls._fetch_feed_httpx_sync, sweep_url, pub_name, ProviderType.GOOGLE_RSS_AGGREGATOR
-                )
-            )
-            feed_keys.append(f"rss_{pub_name.lower().replace(' ', '_').replace('.', '_')}")
-
-        # Execute RSS tasks with per-provider isolation
-        rss_results = await asyncio.gather(*feed_tasks, return_exceptions=True)
-        for key, res in zip(feed_keys, rss_results):
-            if isinstance(res, list):
-                for item in res:
-                    add_article(item)
-                provider_outcomes[key] = {
-                    "status": "SUCCESS",
-                    "count": len(res),
-                }
-            else:
-                provider_outcomes[key] = {
-                    "status": "FAILED",
-                    "error": str(res),
-                    "count": 0,
-                }
-
-        provider_outcomes["google_news_rss_total"] = {
-            "status": "SUCCESS" if any(provider_outcomes[k]["status"] == "SUCCESS" for k in feed_keys) else "FAILED",
-            "count": sum(provider_outcomes[k]["count"] for k in feed_keys if provider_outcomes[k]["status"] == "SUCCESS"),
-            "latency_ms": round((time.time() - t_rss) * 1000, 1),
+    @staticmethod
+    def build_search_query(ticker: str, company_name: str, hours: int,
+                           asset_type=AssetType.EQUITY) -> str:
+        # An AND query such as "AAPL Apple Inc." misses headlines that only say Apple.
+        core = re.sub(r"\b(incorporated|inc|corporation|corp|limited|ltd|plc)\b", "", company_name,
+                      flags=re.IGNORECASE)
+        core = re.sub(r"\s+", " ", core).strip(" .")
+        aliases = {
+            "GC=F": ["gold"], "SI=F": ["silver"], "CL=F": ["crude oil", "WTI"],
+            "BZ=F": ["Brent oil"], "NG=F": ["natural gas"], "HG=F": ["copper"],
+            "BTC-USD": ["bitcoin", "BTC"], "ETH-USD": ["ethereum", "ETH"],
+            "SOL-USD": ["solana", "SOL"],
         }
+        terms = [ticker.replace('"', ""), core.replace('"', ""), *aliases.get(ticker, [])]
+        terms = list(dict.fromkeys(t for t in terms if t))
+        subject = "(" + " OR ".join('"' + t + '"' for t in terms) + ")"
+        finance = " (stock OR shares OR earnings OR profit OR revenue OR dividend OR analyst)" if asset_type in (
+            AssetType.EQUITY, AssetType.ETF) else ""
+        return f"{subject}{finance} when:{hours}h"
 
-        logger.info(
-            f"Ingestion sweep completed for {ticker} ({asset_type.value}): "
-            f"{len(all_articles)} unique headlines ingested across {len(provider_outcomes)} feeds."
-        )
-        return all_articles, provider_outcomes
+    @classmethod
+    async def fetch_news_for_session(cls, ticker, company_name, session,
+                                     asset_type=AssetType.EQUITY, yf_symbol=""):
+        """Fetch public RSS sources concurrently, independently of FinBERT and quote APIs."""
+        symbol = urllib.parse.quote(yf_symbol or ticker, safe="")
+        hours = min(72, max(1, math.ceil(session.window_duration_hours) + 1))
+        query = cls.build_search_query(ticker, company_name, hours, asset_type)
+        def google_url(q):
+            return "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+                "q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"})
+        feeds = [
+            ("Yahoo Finance RSS", f"https://finance.yahoo.com/rss/headline?s={symbol}", ProviderType.YFINANCE),
+            ("Google News", google_url(query), ProviderType.GOOGLE_RSS_AGGREGATOR),
+            ("CNBC direct RSS", "https://www.cnbc.com/id/100003114/device/rss/rss.html", ProviderType.DIRECT_RSS),
+        ]
+        domains = (FOREX_COMMODITY_PUBLISHER_DOMAINS
+                   if asset_type in (AssetType.FOREX, AssetType.COMMODITY)
+                   else EQUITY_PUBLISHER_DOMAINS)
+        for publisher, domain in domains.items():
+            feeds.append((f"{publisher} via Google News",
+                          google_url(f"{query} site:{domain}"), ProviderType.GOOGLE_RSS_AGGREGATOR))
+        if asset_type == AssetType.FOREX:
+            feeds.extend([
+                ("FXStreet RSS", "https://www.fxstreet.com/rss/news", ProviderType.FXSTREET_RSS),
+                ("Investing.com Forex RSS", "https://www.investing.com/rss/news_1.rss", ProviderType.INVESTING_FOREX_RSS),
+            ])
+
+        async def get_feed(name, url, provider):
+            started = time.perf_counter()
+            try:
+                articles = await asyncio.to_thread(cls._fetch_feed_httpx_sync, url, name, provider)
+                # RSS channel defaults identify the collector when publisher information is absent.
+                return articles, {
+                    "status": "SUCCESS", "count": len(articles),
+                    "fresh_count": sum(session.is_timestamp_in_window(a.published_at_utc) for a in articles),
+                    "latency_ms": round((time.perf_counter() - started) * 1000),
+                    "url": url, "error": ""}
+            except httpx.HTTPStatusError as exc:
+                code = exc.response.status_code
+                reason = "Rate limited" if code == 429 else ("Access denied by source" if code in (401, 403) else "HTTP error")
+                return [], {"status": "FAILED", "count": 0, "fresh_count": 0,
+                            "latency_ms": round((time.perf_counter() - started) * 1000),
+                            "url": url, "error": f"{reason} ({code})"}
+            except Exception as exc:
+                reason = "Request timed out" if isinstance(exc, httpx.TimeoutException) else (
+                    "Invalid feed response" if isinstance(exc, ValueError) else "Connection or feed parsing error")
+                return [], {"status": "FAILED", "count": 0, "fresh_count": 0,
+                            "latency_ms": round((time.perf_counter() - started) * 1000),
+                            "url": url, "error": reason}
+
+        results = await asyncio.gather(*(get_feed(*feed) for feed in feeds))
+        outcomes, articles, seen_urls, seen_titles = {}, [], set(), set()
+        for (name, _url, _provider), (items, outcome) in zip(feeds, results):
+            outcomes[name] = outcome
+            for article in items:
+                url = article.canonical_url.split("?")[0].rstrip("/").lower()
+                title = article.title.strip().lower()
+                if (url and url in seen_urls) or (title and title in seen_titles):
+                    continue
+                if url:
+                    seen_urls.add(url)
+                seen_titles.add(title)
+                articles.append(article)
+        logger.info("Collected %s unique headlines for %s across %s feeds.", len(articles), ticker, len(feeds))
+        return articles, outcomes
 
