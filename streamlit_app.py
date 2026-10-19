@@ -5,6 +5,7 @@ import asyncio
 import html
 import os
 import time
+from pathlib import Path
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -22,6 +23,13 @@ try:
             os.environ[key] = str(value)
 except st.errors.StreamlitSecretNotFoundError:
     pass
+
+from app_bootstrap import refresh_package_sources
+
+# A git pull may rerun this file without restarting the Python process.
+# Refresh old app modules before importing newly added model/helper names.
+refresh_package_sources(Path(__file__).resolve().parent / "app",
+                        on_reload=st.cache_resource.clear)
 
 from app.config import settings
 from app.core.models import AnalysisResult, NewsCollection
