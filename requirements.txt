@@ -1,0 +1,15 @@
+# CPU wheels avoid installing CUDA libraries on Linux hosting.
+--extra-index-url https://download.pytorch.org/whl/cpu
+streamlit==1.50.0
+pandas>=2.2,<3
+pydantic>=2.10,<3
+pydantic-settings>=2.7,<3
+httpx>=0.28,<0.29
+transformers==4.57.1
+torch==2.8.0+cpu; platform_system == "Linux"
+torch==2.8.0; platform_system != "Linux"
+yfinance>=0.2.65,<1
+feedparser>=6.0.11,<7
+openai>=1.58,<3
+python-dotenv>=1.0,<2
+tzdata>=2025.1
